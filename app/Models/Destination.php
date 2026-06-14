@@ -15,8 +15,14 @@ class Destination extends Model
         'name',
         'slug',
         'description',
+        'history',
+        'culture',
+        'myth',
+        'tradition',
         'thumbnail',
         'gallery',
+        'panorama_image',
+        'photo_spots',   
         'address',
         'latitude',
         'longitude',
@@ -27,6 +33,7 @@ class Destination extends Model
     {
         return [
             'gallery' => 'array',
+            'photo_spots' => 'array',
             'is_active' => 'boolean',
         ];
     }

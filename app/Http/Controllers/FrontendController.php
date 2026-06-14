@@ -10,7 +10,10 @@ use App\Models\Review;
 use App\Models\Itinerary;
 use App\Models\Gallery;
 use App\Models\PageView;
+use App\Models\Story;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 
 class FrontendController extends Controller
@@ -33,53 +36,98 @@ class FrontendController extends Controller
         return view('frontend.home', compact('destinations', 'events', 'news', 'itineraries', 'mapDestinations', 'mapUmkms'));
     }
 
+    public function destinationIndex()
+    {
+        // Mengambil semua destinasi yang aktif beserta relasi desanya, dengan pagination
+        $destinations = \App\Models\Destination::with(['village', 'reviews'])
+            ->where('is_active', true)
+            ->latest()
+            ->paginate(12);
+
+        $page_title = 'Jelajahi Semua Destinasi';
+        return view('frontend.destinations.index', compact('destinations', 'page_title'));
+    }
     public function showDestination($slug)
     {
         $destination = Destination::with(['village', 'reviews' => function ($query) {
             $query->where('is_approved', true)->latest();
         }])->where('slug', $slug)->where('is_active', true)->firstOrFail();
 
-        // LBS ALGORITHM (Location Based System) - Mencari UMKM Terdekat
+        // 1. LBS ALGORITHM - Mencari UMKM Terdekat
         $nearbyUmkms = collect();
         if ($destination->latitude && $destination->longitude) {
             $lat = (float) $destination->latitude;
             $lon = (float) $destination->longitude;
-
-            // Mengambil semua UMKM aktif yang memiliki koordinat
             $allUmkms = Umkm::with('village')->where('is_active', true)->whereNotNull('latitude')->whereNotNull('longitude')->get();
-
-            // Filter menggunakan rumus Haversine (menghitung jarak dalam Kilometer)
             $nearbyUmkms = $allUmkms->filter(function ($umkm) use ($lat, $lon) {
                 $uLat = (float) $umkm->latitude;
                 $uLon = (float) $umkm->longitude;
-
-                $earthRadius = 6371; // Jari-jari bumi dalam KM
-
+                $earthRadius = 6371;
                 $dLat = deg2rad($uLat - $lat);
                 $dLon = deg2rad($uLon - $lon);
-
                 $a = sin($dLat / 2) * sin($dLat / 2) + cos(deg2rad($lat)) * cos(deg2rad($uLat)) * sin($dLon / 2) * sin($dLon / 2);
                 $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
-
                 $distance = $earthRadius * $c;
-
-                // Simpan jarak ke dalam object model agar bisa ditampilkan di View
                 $umkm->distance_km = round($distance, 1);
-
-                // Hanya ambil UMKM dalam radius maksimal 15 KM
                 return $distance <= 15;
-            })->sortBy('distance_km')->take(4); // Urutkan dari yang terdekat, ambil maksimal 4
+            })->sortBy('distance_km')->take(4);
         }
 
-        // SEO Injection
+        // 2. API Cuaca dengan Smart Caching
+        $weather = null;
+        if ($destination->latitude && $destination->longitude) {
+            $cacheKey = 'weather_dest_' . $destination->id;
+            $weather = Cache::remember($cacheKey, 3600, function () use ($destination) {
+                $apiKey = env('OPENWEATHER_API_KEY');
+                if (!$apiKey) return null;
+                try {
+                    $response = Http::timeout(5)->get("https://api.openweathermap.org/data/2.5/weather", [
+                        'lat' => $destination->latitude,
+                        'lon' => $destination->longitude,
+                        'appid' => $apiKey,
+                        'units' => 'metric',
+                        'lang' => 'id'
+                    ]);
+                    if ($response->successful()) return $response->json();
+                } catch (\Exception $e) {
+                    return null;
+                }
+                return null;
+            });
+        }
+
+        // 3. NEW FITUR: Perhitungan Matematika Golden Hour Secara Akurat (WITA / UTC + 8)
+        $goldenHour = null;
+        if ($destination->latitude && $destination->longitude) {
+            $lat = (float) $destination->latitude;
+            $lon = (float) $destination->longitude;
+
+            // Mengambil info posisi matahari berdasarkan waktu sekarang dan koordinat lokal
+            $sunInfo = date_sun_info(time(), $lat, $lon);
+
+            if ($sunInfo) {
+                // Konversi timestamp UTC bawaan PHP ke format jam operasional WITA (UTC + 8)
+                // Ditambah toleransi durasi golden hour sekitar 45-60 menit
+                $sunriseTime = \Carbon\Carbon::parse($sunInfo['sunrise'])->timezone('Asia/Makassar');
+                $sunsetTime = \Carbon\Carbon::parse($sunInfo['sunset'])->timezone('Asia/Makassar');
+
+                $goldenHour = [
+                    'morning_start' => $sunriseTime->format('H:i'),
+                    'morning_end' => $sunriseTime->addMinutes(45)->format('H:i'),
+                    'evening_start' => $sunsetTime->subMinutes(45)->format('H:i'),
+                    'evening_end' => $sunsetTime->addMinutes(45)->format('H:i'),
+                ];
+            }
+        }
+
+        // 4. SEO Injection
         $page_title = $destination->name . ' - Destinasi Wisata';
         $page_description = Str::limit(strip_tags($destination->description), 160);
         $page_image = asset('storage/' . $destination->thumbnail);
 
-        return view('frontend.destinations.show', compact('destination', 'nearbyUmkms', 'page_title', 'page_description', 'page_image'));
+        // Lempar variabel $goldenHour ke view
+        return view('frontend.destinations.show', compact('destination', 'nearbyUmkms', 'weather', 'goldenHour', 'page_title', 'page_description', 'page_image'));
     }
-
-    // ... (method storeReview, umkmIndex, umkmShow, itineraryIndex, itineraryShow, galleryIndex tetap sama) ...
     public function storeReview(Request $request, $destinationId)
     {
         $validatedData = $request->validate(['reviewer_name' => 'required|string|max:255', 'rating' => 'required|integer|min:1|max:5', 'comment' => 'required|string',]);
@@ -126,5 +174,158 @@ class FrontendController extends Controller
         $galleries = Gallery::where('is_active', true)->latest()->paginate(24);
         $page_title = 'Galeri Pesona Sumba Barat Daya';
         return view('frontend.galleries.index', compact('galleries', 'page_title'));
+    }
+    public function storyIndex()
+    {
+        $stories = Story::where('is_approved', true)->latest()->paginate(9);
+        $page_title = 'Cerita Sumba - Pengalaman Wisatawan';
+        return view('frontend.stories.index', compact('stories', 'page_title'));
+    }
+
+    public function storyCreate()
+    {
+        $page_title = 'Bagikan Cerita Sumba Anda';
+        return view('frontend.stories.create', compact('page_title'));
+    }
+
+    public function storyStore(Request $request)
+    {
+        $request->validate([
+            'title' => 'required|string|max:255',
+            'author_name' => 'required|string|max:255',
+            'content' => 'required|string',
+            'photo' => 'nullable|image|max:2048'
+        ]);
+
+        $path = null;
+        if ($request->hasFile('photo')) {
+            $path = $request->file('photo')->store('stories', 'public');
+        }
+
+        Story::create([
+            'title' => $request->title,
+            'slug' => Str::slug($request->title) . '-' . uniqid(),
+            'author_name' => $request->author_name,
+            'content' => $request->content,
+            'photo_path' => $path,
+            'is_approved' => false // Secara default menunggu persetujuan Admin
+        ]);
+
+        return redirect()->route('story.index')->with('success', 'Cerita Anda berhasil dikirim dan sedang menunggu moderasi dari tim kami. Terima kasih telah berbagi pengalaman!');
+    }
+
+    public function storyShow($slug)
+    {
+        $story = Story::where('slug', $slug)->where('is_approved', true)->firstOrFail();
+        $page_title = $story->title;
+        return view('frontend.stories.show', compact('story', 'page_title'));
+    }
+
+
+    public function smartPlanner()
+    {
+        $page_title = 'Smart Planner - Buat Rute Otomatis';
+        return view('frontend.planner.index', compact('page_title'));
+    }
+
+    public function generateSmartPlanner(Request $request)
+    {
+        $request->validate([
+            'days' => 'required|integer|min:1|max:7',
+            'interest' => 'required|in:alam,budaya,kuliner,campur',
+            'pace' => 'required|in:santai,padat'
+        ]);
+
+        $days = (int) $request->days;
+        $interest = $request->interest;
+        $pace = $request->pace;
+
+        // Aturan Heuristik (Kecepatan / Pace)
+        $destinationsPerDay = ($pace == 'santai') ? 2 : 3;
+        $umkmPerDay = ($pace == 'santai') ? 1 : 2;
+
+        // Ambil Data Destinasi
+        $destQuery = Destination::with('village')->where('is_active', true);
+        if ($interest == 'alam') {
+            $destQuery->where(function ($q) {
+                $q->where('description', 'like', '%pantai%')->orWhere('description', 'like', '%danau%')->orWhere('description', 'like', '%alam%');
+            });
+        } elseif ($interest == 'budaya') {
+            $destQuery->where(function ($q) {
+                $q->where('description', 'like', '%adat%')->orWhere('description', 'like', '%budaya%')->orWhere('description', 'like', '%kampung%');
+            });
+        }
+        $availableDestinations = $destQuery->inRandomOrder()->get();
+
+        // Fallback jika data kurang
+        if ($availableDestinations->count() < ($days * $destinationsPerDay)) {
+            $availableDestinations = Destination::with('village')->where('is_active', true)->inRandomOrder()->get();
+        }
+
+        // Ambil Data UMKM
+        $umkmQuery = Umkm::with('village')->where('is_active', true);
+        if ($interest == 'kuliner') {
+            $umkmQuery->where('category', 'Kuliner');
+        } elseif ($interest == 'budaya') {
+            $umkmQuery->whereIn('category', ['Kriya', 'Fashion']);
+        }
+        $availableUmkms = $umkmQuery->inRandomOrder()->get();
+
+        // Fallback
+        if ($availableUmkms->count() < ($days * $umkmPerDay)) {
+            $availableUmkms = Umkm::with('village')->where('is_active', true)->inRandomOrder()->get();
+        }
+
+        // Generate Rute Array Multidimensi
+        $generatedItinerary = [];
+        $destIndex = 0;
+        $umkmIndex = 0;
+
+        for ($i = 1; $i <= $days; $i++) {
+            $dayPlan = [];
+
+            for ($j = 0; $j < $destinationsPerDay; $j++) {
+                if (isset($availableDestinations[$destIndex])) {
+                    $dayPlan[] = ['type' => 'destination', 'item' => $availableDestinations[$destIndex]];
+                    $destIndex++;
+                }
+            }
+
+            for ($k = 0; $k < $umkmPerDay; $k++) {
+                if (isset($availableUmkms[$umkmIndex])) {
+                    $dayPlan[] = ['type' => 'umkm', 'item' => $availableUmkms[$umkmIndex]];
+                    $umkmIndex++;
+                }
+            }
+            // Acak urutan dalam satu hari biar natural (tidak selalu destinasi duluan)
+            shuffle($dayPlan);
+            $generatedItinerary[$i] = $dayPlan;
+        }
+
+        $page_title = 'Rekomendasi Rute Anda';
+        return view('frontend.planner.result', compact('generatedItinerary', 'days', 'interest', 'pace', 'page_title'));
+    }
+
+    public function newsIndex()
+    {
+        // Mengambil berita yang sudah di-publish, diurutkan dari yang terbaru
+        $news = News::with('user')->where('status', 'published')->latest('published_at')->paginate(12);
+
+        $page_title = 'Kabar Pariwisata Sumba';
+        return view('frontend.news.index', compact('news', 'page_title'));
+    }
+    public function newsShow($slug)
+    {
+        $article = News::with('user')->where('slug', $slug)->where('status', 'published')->firstOrFail();
+
+        // Ambil berita terkait/terbaru lainnya
+        $relatedNews = News::where('status', 'published')
+            ->where('id', '!=', $article->id)
+            ->latest('published_at')
+            ->take(3)
+            ->get();
+
+        $page_title = $article->title;
+        return view('frontend.news.show', compact('article', 'relatedNews', 'page_title'));
     }
 }
